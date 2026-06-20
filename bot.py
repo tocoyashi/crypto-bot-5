@@ -19,7 +19,7 @@ TOP_N_COINS = 50
 STABLECOINS = ['USDC/USDT', 'TUSD/USDT', 'DAI/USDT', 'FDUSD/USDT', 'USDP/USDT', 'PYUSD/USDT']
 
 # ================= Risk Management Settings =================
-LEVERAGE = 12
+LEVERAGE = 10
 TP1_PERC = 0.6
 TP2_PERC = 1.5
 TP3_PERC = 2.4
