@@ -1,66 +1,48 @@
-"""
-Backtest Script - Squeeze Momentum Strategy (Optimized v3)
-- CSV output (no openpyxl needed)
-- Fixed false signals: SELL now requires squeeze release (like BUY)
-- Stronger filters for quality signals
-"""
-
 import pandas as pd
 import numpy as np
+from scipy import stats
 import ccxt
+import requests
+import os
 import time
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
+import json
+from collections import defaultdict
 warnings.filterwarnings('ignore')
 
-# ================= Settings =================
+# ================= BACKTEST CONFIGURATION =================
 TIMEFRAME = '15m'
 TOP_N_COINS = 50
+DAYS_BACK = 30
+INITIAL_BALANCE = 1000
+RISK_PER_TRADE = 0.02
 LEVERAGE = 10
 
-# MEXC Futures Taker Fee
-MEXC_TAKER_FEE = 0.0002  # 0.02%
+TP1_PERC = 0.8
+TP2_PERC = 1.6
+TP3_PERC = 3.0
+TP4_PERC = 6.0
+SL_PERC = 6.0
+SL_MOVE_AFTER_TP1 = 0.10
 
-# Excluded coins
+TP1_SIZE = 0.50
+TP2_SIZE = 0.25
+TP3_SIZE = 0.10
+TP4_SIZE = 0.15
+
+FEE_RATE = 0.0006
+
+STABLECOINS = ['USDC/USDT', 'TUSD/USDT', 'DAI/USDT', 'FDUSD/USDT',
+    'USDP/USDT', 'PYUSD/USDT', 'UST/USDT', 'BUSD/USDT']
 EXCLUDED_COINS = [
     'SPACEX(PRE)/USDT', 'RAIN/USDT', 'TOYL/USDT', 'WXT/USDT',
     'UPC/USDT', 'DN/USDT', 'AIXPLAY/USDT', 'MBG/USDT',
-    'KAZAR/USDT', 'STAR/USDT'
-]
+    'KAZAR/USDT', 'STAR/USDT']
+ALL_EXCLUSIONS = set(STABLECOINS + EXCLUDED_COINS)
 
-STABLECOINS = ['USDC/USDT', 'TUSD/USDT', 'DAI/USDT', 'FDUSD/USDT', 'USDP/USDT', 'PYUSD/USDT']
-
-# TP levels with partial close percentages
-TP_LEVELS = [
-    {'name': 'TP1', 'perc': 0.8,  'close_pct': 0.50},
-    {'name': 'TP2', 'perc': 1.6,  'close_pct': 0.25},
-    {'name': 'TP3', 'perc': 3.0,  'close_pct': 0.10},
-    {'name': 'TP4', 'perc': 6.0,  'close_pct': 0.15},
-]
-
-SL_PERC = 6.0
-SL_AFTER_TP1 = 0.10
-
-# ================= False Signal Filters =================
-MIN_SQUEEZE_BARS = 5          # Minimum squeeze duration (candles) before release
-MIN_MOMENTUM_STRENGTH = 0.0   # Minimum |momentum| value to accept signal
-MIN_VOLUME_RATIO = 1.2        # Signal candle volume must be > X * avg volume(20)
-MIN_ATR_PERCENTILE = 15       # ATR must be above this percentile (avoid dead markets)
-MIN_TRADE_GAP = 60            # Minimum candles between trades on same coin
-
-# Backtest period
-END_DATE = datetime.utcnow()
-START_DATE = END_DATE - timedelta(days=30)
-
-_exchange = None
-
-
-def get_exchange():
-    global _exchange
-    if _exchange is None:
-        _exchange = ccxt.mexc({'enableRateLimit': True})
-    return _exchange
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
+CHANNEL_ID = os.environ.get('CHANNEL_ID')
 
 
 class SqueezeMomentumIndicator:
@@ -70,430 +52,533 @@ class SqueezeMomentumIndicator:
         self.kc_length = kc_length
         self.kc_mult = kc_mult
 
+    def true_range(self, high, low, close):
+        tr1 = high - low
+        tr2 = abs(high - close.shift(1))
+        tr3 = abs(low - close.shift(1))
+        return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    def linear_regression(self, series, length):
+        def linreg_single(x):
+            if len(x) < length:
+                return np.nan
+            y = np.arange(len(x))
+            slope, intercept, _, _, _ = stats.linregress(y, x)
+            return slope * (len(x) - 1) + intercept
+        return series.rolling(window=length).apply(linreg_single, raw=False)
+
     def calculate_indicators(self, df):
         data = df.copy()
-        c, h, l = data['close'], data['high'], data['low']
-
-        bb_basis = c.rolling(self.bb_length).mean()
-        bb_dev = self.bb_mult * c.rolling(self.bb_length).std()
+        bb_basis = data['close'].rolling(window=self.bb_length).mean()
+        bb_dev = self.bb_mult * data['close'].rolling(window=self.bb_length).std()
         upper_bb = bb_basis + bb_dev
         lower_bb = bb_basis - bb_dev
-
-        kc_ma = c.rolling(self.kc_length).mean()
-        tr = pd.concat([h - l, (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1)
-        range_ma = tr.rolling(self.kc_length).mean()
+        kc_ma = data['close'].rolling(window=self.kc_length).mean()
+        tr = self.true_range(data['high'], data['low'], data['close'])
+        range_ma = tr.rolling(window=self.kc_length).mean()
         upper_kc = kc_ma + range_ma * self.kc_mult
         lower_kc = kc_ma - range_ma * self.kc_mult
-
         squeeze_on = (lower_bb > lower_kc) & (upper_bb < upper_kc)
-
-        squeeze_duration = (~squeeze_on).cumsum()
-        squeeze_bars = squeeze_on.groupby(squeeze_duration).cumsum()
-
-        hh = h.rolling(self.kc_length).max()
-        ll = l.rolling(self.kc_length).min()
-        cm = c.rolling(self.kc_length).mean()
-        avg_val = ((hh + ll) / 2 + cm) / 2
-        diff = c - avg_val
-
-        def _linreg(s, w):
-            x = np.arange(w)
-            x_mean = x.mean()
-            x_var = ((x - x_mean) ** 2).sum()
-            def _apply(y):
-                if len(y) < w or np.any(np.isnan(y)):
-                    return np.nan
-                y_c = y - y.mean()
-                return np.dot(x - x_mean, y_c) / x_var * (w - 1) + y_c[-1]
-            return s.rolling(w).apply(_apply, raw=True)
-
-        momentum = _linreg(diff, self.kc_length)
-
-        atr = tr.rolling(14).mean()
-        atr_pct = atr / c * 100
-
-        vol_ma = data['volume'].rolling(20).mean()
-        vol_ratio = data['volume'] / vol_ma
-
+        highest_high = data['high'].rolling(window=self.kc_length).max()
+        lowest_low = data['low'].rolling(window=self.kc_length).min()
+        close_ma = data['close'].rolling(window=self.kc_length).mean()
+        avg_val = ((highest_high + lowest_low) / 2 + close_ma) / 2
+        momentum = self.linear_regression(data['close'] - avg_val, self.kc_length)
         data['squeeze_on'] = squeeze_on
-        data['squeeze_bars'] = squeeze_bars
-        data['squeeze_release'] = squeeze_on.shift(1).fillna(False) & ~squeeze_on
         data['momentum'] = momentum
         data['momentum_increasing'] = momentum > momentum.shift(1)
-        data['atr_pct'] = atr_pct
-        data['atr_pct_rank'] = atr_pct.rolling(100).rank(pct=True)
-        data['vol_ratio'] = vol_ratio
-
         return data
 
     def generate_signals(self, df):
         data = self.calculate_indicators(df)
         data['signal'] = 0
-
-        sq = data['squeeze_release']
-        mom = data['momentum']
-        mi = data['momentum_increasing'].fillna(False)
-        sq_bars = data['squeeze_bars'].shift(1).fillna(0)
-        atr_rank = data['atr_pct_rank']
-        vol_r = data['vol_ratio']
-
-        # Common filter: quality check
-        quality = (
-            (sq_bars >= MIN_SQUEEZE_BARS) &
-            (atr_rank > MIN_ATR_PERCENTILE / 100) &
-            (vol_r > MIN_VOLUME_RATIO)
-        )
-
-        # BUY: squeeze release + positive momentum + increasing + quality
+        squeeze_on_safe = data['squeeze_on'].fillna(False).astype(bool)
+        mom_inc_safe = data['momentum_increasing'].fillna(False).astype(bool)
+        data['squeeze_release'] = (squeeze_on_safe.shift(1) == True) & (squeeze_on_safe == False)
         buy_cond = (
-            sq &
-            (mom > MIN_MOMENTUM_STRENGTH) &
-            mi &
-            quality
-        )
-
-        # SELL: squeeze release + negative momentum + decreasing + quality
-        # (FIXED: SELL now also requires squeeze release like BUY)
+            (data['squeeze_release'] == True) &
+            (data['momentum'] > 0) &
+            (mom_inc_safe == True))
         sell_cond = (
-            sq &
-            (mom < -MIN_MOMENTUM_STRENGTH) &
-            (~mi) &
-            quality
-        )
-
+            ((data['momentum'] < 0) & (data['momentum'].shift(1).fillna(0) >= 0)) |
+            ((mom_inc_safe == False) & (mom_inc_safe.shift(1).fillna(True) == False) & (data['momentum'] > 0)))
         data.loc[buy_cond, 'signal'] = 1
         data.loc[sell_cond, 'signal'] = -1
         return data
 
 
-def fetch_ohlcv(symbol, start_ms, end_ms):
-    exchange = get_exchange()
-    all_data = []
-    since = start_ms
+class AdvancedBacktestEngine:
+    def __init__(self, initial_balance=1000, risk_per_trade=0.02, leverage=10):
+        self.initial_balance = initial_balance
+        self.balance = initial_balance
+        self.risk_per_trade = risk_per_trade
+        self.leverage = leverage
+        self.trades = []
+        self.equity_curve = []
 
-    while since < end_ms:
+    def calculate_targets(self, entry_price, signal_type):
+        if signal_type == 1:
+            tp1 = entry_price * (1 + TP1_PERC / 100)
+            tp2 = entry_price * (1 + TP2_PERC / 100)
+            tp3 = entry_price * (1 + TP3_PERC / 100)
+            tp4 = entry_price * (1 + TP4_PERC / 100)
+            sl = entry_price * (1 - SL_PERC / 100)
+            sl_after_tp1 = entry_price * (1 + SL_MOVE_AFTER_TP1 / 100)
+        else:
+            tp1 = entry_price * (1 - TP1_PERC / 100)
+            tp2 = entry_price * (1 - TP2_PERC / 100)
+            tp3 = entry_price * (1 - TP3_PERC / 100)
+            tp4 = entry_price * (1 - TP4_PERC / 100)
+            sl = entry_price * (1 + SL_PERC / 100)
+            sl_after_tp1 = entry_price * (1 - SL_MOVE_AFTER_TP1 / 100)
+        return {'tp1': tp1, 'tp2': tp2, 'tp3': tp3, 'tp4': tp4,
+                'sl_initial': sl, 'sl_after_tp1': sl_after_tp1}
+
+    def simulate_trade(self, entry_price, signal_type, entry_time, symbol, df_future):
+        targets = self.calculate_targets(entry_price, signal_type)
+        risk_amount = self.balance * self.risk_per_trade
+        if signal_type == 1:
+            price_risk_pct = (entry_price - targets['sl_initial']) / entry_price
+        else:
+            price_risk_pct = (targets['sl_initial'] - entry_price) / entry_price
+        if price_risk_pct == 0:
+            return None
+        position_notional = risk_amount / price_risk_pct
+        entry_fee = position_notional * FEE_RATE
+        remaining_size = 1.0
+        realized_pnl = 0.0
+        total_fees = entry_fee
+        current_sl = targets['sl_initial']
+        tp1_hit = False
+        tp2_hit = False
+        tp3_hit = False
+        tp4_hit = False
+        exits = []
+
+        for idx, row in df_future.iterrows():
+            high, low = row['high'], row['low']
+            if signal_type == 1:
+                if low <= current_sl and remaining_size > 0:
+                    close_size = remaining_size
+                    pnl_pct = (current_sl - entry_price) / entry_price
+                    pnl = position_notional * close_size * pnl_pct * LEVERAGE
+                    exit_fee = position_notional * close_size * FEE_RATE
+                    realized_pnl += pnl
+                    total_fees += exit_fee
+                    remaining_size = 0
+                    exits.append({'type': 'SL', 'price': current_sl, 'size': close_size,
+                                  'pnl': pnl, 'fee': exit_fee, 'time': idx})
+                    break
+                if not tp1_hit and high >= targets['tp1'] and remaining_size > 0:
+                    close_size = TP1_SIZE
+                    pnl_pct = (targets['tp1'] - entry_price) / entry_price
+                    pnl = position_notional * close_size * pnl_pct * LEVERAGE
+                    exit_fee = position_notional * close_size * FEE_RATE
+                    realized_pnl += pnl
+                    total_fees += exit_fee
+                    remaining_size -= close_size
+                    tp1_hit = True
+                    current_sl = targets['sl_after_tp1']
+                    exits.append({'type': 'TP1', 'price': targets['tp1'], 'size': close_size,
+                                  'pnl': pnl, 'fee': exit_fee, 'time': idx})
+                if not tp2_hit and high >= targets['tp2'] and remaining_size > 0:
+                    close_size = TP2_SIZE
+                    pnl_pct = (targets['tp2'] - entry_price) / entry_price
+                    pnl = position_notional * close_size * pnl_pct * LEVERAGE
+                    exit_fee = position_notional * close_size * FEE_RATE
+                    realized_pnl += pnl
+                    total_fees += exit_fee
+                    remaining_size -= close_size
+                    tp2_hit = True
+                    exits.append({'type': 'TP2', 'price': targets['tp2'], 'size': close_size,
+                                  'pnl': pnl, 'fee': exit_fee, 'time': idx})
+                if not tp3_hit and high >= targets['tp3'] and remaining_size > 0:
+                    close_size = TP3_SIZE
+                    pnl_pct = (targets['tp3'] - entry_price) / entry_price
+                    pnl = position_notional * close_size * pnl_pct * LEVERAGE
+                    exit_fee = position_notional * close_size * FEE_RATE
+                    realized_pnl += pnl
+                    total_fees += exit_fee
+                    remaining_size -= close_size
+                    tp3_hit = True
+                    exits.append({'type': 'TP3', 'price': targets['tp3'], 'size': close_size,
+                                  'pnl': pnl, 'fee': exit_fee, 'time': idx})
+                if not tp4_hit and high >= targets['tp4'] and remaining_size > 0:
+                    close_size = TP4_SIZE
+                    pnl_pct = (targets['tp4'] - entry_price) / entry_price
+                    pnl = position_notional * close_size * pnl_pct * LEVERAGE
+                    exit_fee = position_notional * close_size * FEE_RATE
+                    realized_pnl += pnl
+                    total_fees += exit_fee
+                    remaining_size -= close_size
+                    tp4_hit = True
+                    exits.append({'type': 'TP4', 'price': targets['tp4'], 'size': close_size,
+                                  'pnl': pnl, 'fee': exit_fee, 'time': idx})
+                    break
+            else:
+                if high >= current_sl and remaining_size > 0:
+                    close_size = remaining_size
+                    pnl_pct = (entry_price - current_sl) / entry_price
+                    pnl = position_notional * close_size * pnl_pct * LEVERAGE
+                    exit_fee = position_notional * close_size * FEE_RATE
+                    realized_pnl += pnl
+                    total_fees += exit_fee
+                    remaining_size = 0
+                    exits.append({'type': 'SL', 'price': current_sl, 'size': close_size,
+                                  'pnl': pnl, 'fee': exit_fee, 'time': idx})
+                    break
+                if not tp1_hit and low <= targets['tp1'] and remaining_size > 0:
+                    close_size = TP1_SIZE
+                    pnl_pct = (entry_price - targets['tp1']) / entry_price
+                    pnl = position_notional * close_size * pnl_pct * LEVERAGE
+                    exit_fee = position_notional * close_size * FEE_RATE
+                    realized_pnl += pnl
+                    total_fees += exit_fee
+                    remaining_size -= close_size
+                    tp1_hit = True
+                    current_sl = targets['sl_after_tp1']
+                    exits.append({'type': 'TP1', 'price': targets['tp1'], 'size': close_size,
+                                  'pnl': pnl, 'fee': exit_fee, 'time': idx})
+                if not tp2_hit and low <= targets['tp2'] and remaining_size > 0:
+                    close_size = TP2_SIZE
+                    pnl_pct = (entry_price - targets['tp2']) / entry_price
+                    pnl = position_notional * close_size * pnl_pct * LEVERAGE
+                    exit_fee = position_notional * close_size * FEE_RATE
+                    realized_pnl += pnl
+                    total_fees += exit_fee
+                    remaining_size -= close_size
+                    tp2_hit = True
+                    exits.append({'type': 'TP2', 'price': targets['tp2'], 'size': close_size,
+                                  'pnl': pnl, 'fee': exit_fee, 'time': idx})
+                if not tp3_hit and low <= targets['tp3'] and remaining_size > 0:
+                    close_size = TP3_SIZE
+                    pnl_pct = (entry_price - targets['tp3']) / entry_price
+                    pnl = position_notional * close_size * pnl_pct * LEVERAGE
+                    exit_fee = position_notional * close_size * FEE_RATE
+                    realized_pnl += pnl
+                    total_fees += exit_fee
+                    remaining_size -= close_size
+                    tp3_hit = True
+                    exits.append({'type': 'TP3', 'price': targets['tp3'], 'size': close_size,
+                                  'pnl': pnl, 'fee': exit_fee, 'time': idx})
+                if not tp4_hit and low <= targets['tp4'] and remaining_size > 0:
+                    close_size = TP4_SIZE
+                    pnl_pct = (entry_price - targets['tp4']) / entry_price
+                    pnl = position_notional * close_size * pnl_pct * LEVERAGE
+                    exit_fee = position_notional * close_size * FEE_RATE
+                    realized_pnl += pnl
+                    total_fees += exit_fee
+                    remaining_size -= close_size
+                    tp4_hit = True
+                    exits.append({'type': 'TP4', 'price': targets['tp4'], 'size': close_size,
+                                  'pnl': pnl, 'fee': exit_fee, 'time': idx})
+                    break
+
+        if remaining_size > 0:
+            return None
+        net_pnl = realized_pnl - total_fees
+        self.balance += net_pnl
+        final_exit = exits[-1]['type'] if exits else 'UNKNOWN'
+        return {
+            'symbol': symbol, 'type': 'LONG' if signal_type == 1 else 'SHORT',
+            'entry': entry_price, 'entry_time': entry_time,
+            'exit_time': exits[-1]['time'] if exits else None,
+            'final_exit': final_exit, 'net_pnl': net_pnl,
+            'gross_pnl': realized_pnl, 'total_fees': total_fees,
+            'pnl_pct': (net_pnl / self.initial_balance) * 100,
+            'exits': exits, 'position_notional': position_notional,
+            'sl_initial': targets['sl_initial'], 'sl_after_tp1': targets['sl_after_tp1']}
+
+    def run_backtest(self, all_signals_data):
+        print("Simulating " + str(len(all_signals_data)) + " trades...")
+        for i, signal in enumerate(all_signals_data):
+            if (i + 1) % 50 == 0:
+                print("  Processed " + str(i+1) + "/" + str(len(all_signals_data)) + " trades...")
+            result = self.simulate_trade(
+                signal['entry_price'], signal['signal_type'],
+                signal['signal_time'], signal['symbol'], signal['df_future'])
+            if result:
+                self.trades.append(result)
+                self.equity_curve.append({'time': result['exit_time'], 'balance': self.balance})
+        return self.generate_report()
+
+    def generate_report(self):
+        if not self.trades:
+            return {"error": "No trades executed"}
+        total_trades = len(self.trades)
+        winning_trades = len([t for t in self.trades if t['net_pnl'] > 0])
+        losing_trades = len([t for t in self.trades if t['net_pnl'] < 0])
+        breakeven = total_trades - winning_trades - losing_trades
+        win_rate = (winning_trades / total_trades) * 100 if total_trades > 0 else 0
+        total_gross_pnl = sum(t['gross_pnl'] for t in self.trades)
+        total_fees = sum(t['total_fees'] for t in self.trades)
+        total_net_pnl = sum(t['net_pnl'] for t in self.trades)
+        avg_net_pnl = total_net_pnl / total_trades if total_trades > 0 else 0
+        avg_win = np.mean([t['net_pnl'] for t in self.trades if t['net_pnl'] > 0]) if winning_trades > 0 else 0
+        avg_loss = np.mean([t['net_pnl'] for t in self.trades if t['net_pnl'] < 0]) if losing_trades > 0 else 0
+        max_drawdown = self.calculate_max_drawdown()
+        profit_factor = abs(sum(t['net_pnl'] for t in self.trades if t['net_pnl'] > 0) /
+                           sum(t['net_pnl'] for t in self.trades if t['net_pnl'] < 0)) if losing_trades > 0 else float('inf')
+        exit_dist = defaultdict(int)
+        for t in self.trades:
+            exit_dist[t['final_exit']] += 1
+        tp1_hits = sum(1 for t in self.trades if any(e['type'] == 'TP1' for e in t['exits']))
+        tp2_hits = sum(1 for t in self.trades if any(e['type'] == 'TP2' for e in t['exits']))
+        tp3_hits = sum(1 for t in self.trades if any(e['type'] == 'TP3' for e in t['exits']))
+        tp4_hits = sum(1 for t in self.trades if any(e['type'] == 'TP4' for e in t['exits']))
+        sl_hits = sum(1 for t in self.trades if t['final_exit'] == 'SL')
+        expectancy = (win_rate/100 * avg_win) + ((100-win_rate)/100 * avg_loss) if total_trades > 0 else 0
+        return {
+            'total_trades': total_trades, 'winning_trades': winning_trades,
+            'losing_trades': losing_trades, 'breakeven': breakeven, 'win_rate': win_rate,
+            'initial_balance': self.initial_balance, 'final_balance': self.balance,
+            'total_return_usdt': self.balance - self.initial_balance,
+            'total_return_pct': ((self.balance - self.initial_balance) / self.initial_balance) * 100,
+            'total_gross_pnl': total_gross_pnl, 'total_fees': total_fees,
+            'total_net_pnl': total_net_pnl, 'avg_net_pnl': avg_net_pnl,
+            'avg_win': avg_win, 'avg_loss': avg_loss, 'max_drawdown_pct': max_drawdown,
+            'profit_factor': profit_factor, 'expectancy': expectancy,
+            'exit_distribution': dict(exit_dist),
+            'tp_hits': {'TP1': tp1_hits, 'TP2': tp2_hits, 'TP3': tp3_hits, 'TP4': tp4_hits, 'SL': sl_hits},
+            'trades': self.trades}
+
+    def calculate_max_drawdown(self):
+        if not self.equity_curve:
+            return 0
+        balances = [self.initial_balance] + [e['balance'] for e in self.equity_curve]
+        peak = balances[0]
+        max_dd = 0
+        for balance in balances:
+            if balance > peak:
+                peak = balance
+            dd = (peak - balance) / peak * 100
+            if dd > max_dd:
+                max_dd = dd
+        return max_dd
+
+
+def get_historical_data(symbol, timeframe, days):
+    exchange = ccxt.mexc({'enableRateLimit': True})
+    since = exchange.parse8601((datetime.utcnow() - timedelta(days=days)).isoformat())
+    all_data = []
+    while True:
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, since=since, limit=1000)
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
             if not ohlcv:
                 break
             all_data.extend(ohlcv)
-            last_ts = ohlcv[-1][0]
-            if last_ts <= since:
-                break
-            since = last_ts + 1
-        except Exception:
+            since = ohlcv[-1][0] + 1
+            time.sleep(0.3)
+        except Exception as e:
+            print("    Error fetching " + symbol + ": " + str(e))
             break
-
     if not all_data:
         return pd.DataFrame()
-
     df = pd.DataFrame(all_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
-    df = df[~df.index.duplicated(keep='last')]
-    start_dt = pd.to_datetime(start_ms, unit='ms')
-    end_dt = pd.to_datetime(end_ms, unit='ms')
-    df = df.loc[start_dt:end_dt]
+    df = df[~df.index.duplicated(keep='first')]
     return df
 
-
-def fetch_all_data_parallel(coins, start_ms, end_ms, max_workers=5):
-    results = {}
-    print(f"  Fetching data for {len(coins)} coins (parallel, {max_workers} threads)...")
-
-    def _fetch(sym):
-        try:
-            df = fetch_ohlcv(sym, start_ms, end_ms)
-            return sym, df
-        except Exception:
-            return sym, pd.DataFrame()
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_fetch, s): s for s in coins}
-        done = 0
-        for future in as_completed(futures):
-            done += 1
-            sym, df = future.result()
-            results[sym] = df
-            if done % 10 == 0:
-                print(f"    Fetched {done}/{len(coins)}...")
-
-    valid = {k: v for k, v in results.items() if len(v) >= 100}
-    print(f"  Valid data: {len(valid)}/{len(coins)} coins")
-    return valid
-
-
-def simulate_trade_vectorized(entry_price, signal_type, highs, lows):
-    direction = 1 if signal_type == 1 else -1
-
-    tp_prices = np.array([
-        entry_price * (1 + direction * tp['perc'] / 100) for tp in TP_LEVELS
-    ])
-
-    sl_price = entry_price * (1 - direction * SL_PERC / 100)
-    new_sl = entry_price * (1 + direction * SL_AFTER_TP1 / 100)
-
-    position_usdt = 100.0
-    remaining_pct = 1.0
-    open_fee = position_usdt * MEXC_TAKER_FEE
-    total_pnl = 0.0
-    total_fees = open_fee
-    tp_hits = [False] * 4
-    sl_moved = False
-    closed_amounts = []
-    exit_reason = "Timeout"
-    exit_idx = len(highs) - 1
-
-    for i in range(len(highs)):
-        for j in range(4):
-            if tp_hits[j]:
-                continue
-            hit = (direction == 1 and highs[i] >= tp_prices[j]) or \
-                  (direction == -1 and lows[i] <= tp_prices[j])
-            if hit:
-                tp_hits[j] = True
-                cp = TP_LEVELS[j]['close_pct']
-                cu = position_usdt * cp
-                pnl = cu * direction * (tp_prices[j] - entry_price) / entry_price
-                cf = cu * MEXC_TAKER_FEE
-                total_fees += cf
-                total_pnl += pnl - cf
-                remaining_pct -= cp
-                closed_amounts.append({
-                    'tp': TP_LEVELS[j]['name'], 'price': tp_prices[j],
-                    'pct_closed': cp, 'pnl': pnl - cf, 'fee': cf, 'idx': i
-                })
-                if j == 0 and not sl_moved:
-                    sl_moved = True
-                    sl_price = new_sl
-                if remaining_pct <= 0.001:
-                    exit_reason = f"TP{j+1} (All closed)"
-                    exit_idx = i
-                    return _result(exit_reason, i, total_pnl, total_fees, tp_hits, False, sl_moved, closed_amounts)
-
-        sl_hit = (direction == 1 and lows[i] <= sl_price) or \
-                 (direction == -1 and highs[i] >= sl_price)
-        if sl_hit and remaining_pct > 0.001:
-            cu = position_usdt * remaining_pct
-            pnl = cu * direction * (sl_price - entry_price) / entry_price
-            cf = cu * MEXC_TAKER_FEE
-            total_fees += cf
-            total_pnl += pnl - cf
-            closed_amounts.append({
-                'tp': 'SL', 'price': sl_price,
-                'pct_closed': remaining_pct, 'pnl': pnl - cf, 'fee': cf, 'idx': i
-            })
-            return _result("Stop Loss", i, total_pnl, total_fees, tp_hits, True, sl_moved, closed_amounts)
-
-    if remaining_pct > 0.001:
-        last_p = (highs[-1] + lows[-1]) / 2
-        cu = position_usdt * remaining_pct
-        pnl = cu * direction * (last_p - entry_price) / entry_price
-        cf = cu * MEXC_TAKER_FEE
-        total_fees += cf
-        total_pnl += pnl - cf
-        closed_amounts.append({
-            'tp': 'TIMEOUT', 'price': last_p,
-            'pct_closed': remaining_pct, 'pnl': pnl - cf, 'fee': cf, 'idx': exit_idx
-        })
-
-    return _result(exit_reason, exit_idx, total_pnl, total_fees, tp_hits, False, sl_moved, closed_amounts)
-
-
-def _result(reason, idx, pnl, fees, tp_hits, sl_hit, sl_moved, details):
-    return {
-        'exit_reason': reason, 'exit_idx': idx,
-        'total_pnl': pnl, 'total_fees': fees, 'net_pnl': pnl,
-        'tp_hits': sum(tp_hits), 'sl_hit': sl_hit,
-        'sl_moved': sl_moved, 'tp_details': details
-    }
-
-
-def process_coin(symbol, df, indicator):
-    trades = []
-    try:
-        df_sig = indicator.generate_signals(df)
-        signals = df_sig[df_sig['signal'] != 0].index
-
-        if len(df_sig) < 60:
-            return trades
-
-        cutoff = df_sig.index[-30]
-        signals = signals[signals < cutoff]
-
-        last_trade_idx = -9999
-
-        for sig_time in signals:
-            sig_idx = df_sig.index.get_loc(sig_time)
-            sig_type = df_sig.loc[sig_time, 'signal']
-            entry = df_sig.loc[sig_time, 'close']
-
-            if (sig_idx - last_trade_idx) < MIN_TRADE_GAP:
-                continue
-
-            if sig_idx + 60 >= len(df_sig):
-                continue
-
-            future = df_sig.iloc[sig_idx + 1: sig_idx + 600]
-            if len(future) < 60:
-                continue
-
-            highs = future['high'].values
-            lows = future['low'].values
-
-            result = simulate_trade_vectorized(entry, sig_type, highs, lows)
-
-            trade = {
-                'symbol': symbol,
-                'signal_type': 'BUY' if sig_type == 1 else 'SELL',
-                'entry_timestamp': str(sig_time),
-                'entry_price': entry,
-                'exit_timestamp': str(future.index[min(result['exit_idx'], len(future)-1)]),
-                'exit_reason': result['exit_reason'],
-                'tp_hits': result['tp_hits'],
-                'sl_hit': result['sl_hit'],
-                'sl_moved': result['sl_moved'],
-                'total_pnl_pct': (result['net_pnl'] / 100) * 100 * LEVERAGE,
-                'total_fees': result['total_fees'],
-                'net_pnl': result['net_pnl'],
-            }
-
-            for k in range(4):
-                tp_name = TP_LEVELS[k]['name']
-                tp_match = [d for d in result['tp_details'] if d['tp'] == tp_name]
-                trade[f'{tp_name}_price'] = tp_match[0]['price'] if tp_match else None
-                trade[f'{tp_name}_pnl'] = tp_match[0]['pnl'] if tp_match else None
-
-            trades.append(trade)
-            last_trade_idx = sig_idx
-
-    except Exception as e:
-        print(f"    [WARN] {symbol}: {e}")
-
-    return trades
-
-
-def run_backtest():
-    t0 = time.time()
-    print("=" * 60)
-    print("  BACKTEST v3 - Squeeze Momentum (Filtered)")
-    print("=" * 60)
-    print(f"  Period: {START_DATE.strftime('%Y-%m-%d')} to {END_DATE.strftime('%Y-%m-%d')}")
-    print(f"  Timeframe: {TIMEFRAME} | Leverage: {LEVERAGE}x")
-    print(f"  TP: 0.8%(50%), 1.6%(25%), 3%(10%), 6%(15%)")
-    print(f"  SL: {SL_PERC}% -> +{SL_AFTER_TP1}% after TP1")
-    print(f"  MEXC Fee: {MEXC_TAKER_FEE*100:.3f}% (taker)")
-    print(f"  Filters: squeeze>={MIN_SQUEEZE_BARS}bars, vol>{MIN_VOLUME_RATIO}x, ATR>{MIN_ATR_PERCENTILE}%ile")
-    print(f"  Min trade gap: {MIN_TRADE_GAP} candles ({MIN_TRADE_GAP*15/60:.1f}h)")
-    print(f"  Excluded: {len(EXCLUDED_COINS)} coins")
-    print("=" * 60)
-
-    start_ms = int(START_DATE.timestamp() * 1000)
-    end_ms = int(END_DATE.timestamp() * 1000)
-
-    print("\n[1/3] Fetching top coins...")
-    exchange = get_exchange()
+def get_top_mexc_coins(limit=50):
+    print("Fetching top " + str(limit) + " coins from MEXC...")
+    exchange = ccxt.mexc({'enableRateLimit': True})
     try:
         tickers = exchange.fetch_tickers()
         usdt_pairs = []
         for symbol, ticker in tickers.items():
-            if symbol.endswith('/USDT') and symbol not in STABLECOINS and symbol not in EXCLUDED_COINS:
+            if symbol.endswith('/USDT') and symbol not in ALL_EXCLUSIONS:
                 vol = ticker.get('quoteVolume') or 0
-                if vol > 1000000:
+                if vol > 500000:
                     usdt_pairs.append({'symbol': symbol, 'volume': vol})
         usdt_pairs.sort(key=lambda x: x['volume'], reverse=True)
-        top_coins = [p['symbol'] for p in usdt_pairs[:TOP_N_COINS]]
-        print(f"  Found {len(top_coins)} coins")
+        top_coins = [pair['symbol'] for pair in usdt_pairs[:limit]]
+        print("Fetched " + str(len(top_coins)) + " coins")
+        print("Excluded: " + str(len(EXCLUDED_COINS)) + " user-specified + " + str(len(STABLECOINS)) + " stablecoins")
+        return top_coins
     except Exception as e:
-        print(f"  [ERROR] {e}")
-        return
+        print("Error fetching coins list: " + str(e))
+        return []
 
-    print(f"\n[2/3] Fetching OHLCV data (parallel)...")
-    data_map = fetch_all_data_parallel(top_coins, start_ms, end_ms, max_workers=8)
-    if not data_map:
-        print("No valid data. Aborting.")
+def send_telegram_message(message):
+    if not TELEGRAM_TOKEN or not CHANNEL_ID:
         return
+    url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage"
+    payload = {'chat_id': CHANNEL_ID, 'text': message, 'parse_mode': 'HTML'}
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        print("Telegram error: " + str(e))
 
-    print(f"\n[3/3] Running signals & simulation...")
+def format_report_telegram(report, days_back, top_n):
+    if 'error' in report:
+        return "Backtest Error: " + report['error']
+    tp = report['tp_hits']
+    exit_dist = report['exit_distribution']
+    msg = ("Backtest Report - " + str(days_back) + " Days
+
+"
+           "Assets: Top " + str(top_n) + " MEXC Coins
+"
+           "Timeframe: " + TIMEFRAME + "
+"
+           "Leverage: " + str(LEVERAGE) + "x
+"
+           "Initial: " + str(report['initial_balance']) + " USDT
+"
+           "Final: " + str(round(report['final_balance'], 2)) + " USDT
+
+"
+           "Total Trades: " + str(report['total_trades']) + "
+
+"
+           "Winners: " + str(report['winning_trades']) + " (" + str(round(report['win_rate'], 1)) + "%)
+"
+           "Losers: " + str(report['losing_trades']) + " (" + str(round(100-report['win_rate'], 1)) + "%)
+
+"
+           "TP Hits:
+"
+           "TP1 (" + str(TP1_PERC) + "%): " + str(tp['TP1']) + "
+"
+           "TP2 (" + str(TP2_PERC) + "%): " + str(tp['TP2']) + "
+"
+           "TP3 (" + str(TP3_PERC) + "%): " + str(tp['TP3']) + "
+"
+           "TP4 (" + str(TP4_PERC) + "%): " + str(tp['TP4']) + "
+
+"
+           "SL Hits: " + str(tp['SL']) + "
+
+"
+           "Total Gross PnL: " + ("+" if report['total_gross_pnl'] >= 0 else "") + str(round(report['total_gross_pnl'], 2)) + " USDT
+"
+           "Total Fees: " + str(round(report['total_fees'], 2)) + " USDT
+"
+           "Net Return: " + ("+" if report['total_return_pct'] >= 0 else "") + str(round(report['total_return_pct'], 2)) + "%
+"
+           "Max Drawdown: " + str(round(report['max_drawdown_pct'], 2)) + "%
+"
+           "Profit Factor: " + str(round(report['profit_factor'], 2)) + "
+"
+           "Expectancy: " + str(round(report['expectancy'], 2)) + " USDT
+
+"
+           "Fees: MEXC Futures API 0.06% (taker)")
+    return msg
+
+
+def run_full_backtest():
+    print("=" * 70)
+    print("ADVANCED SQUEEZE MOMENTUM - 1 MONTH BACKTEST")
+    print("=" * 70)
+    print("Period: Last " + str(DAYS_BACK) + " days")
+    print("Capital: " + str(INITIAL_BALANCE) + " USDT | Risk: " + str(RISK_PER_TRADE*100) + "% | Leverage: " + str(LEVERAGE) + "x")
+    print("TP1: " + str(TP1_PERC) + "% (50%) | TP2: " + str(TP2_PERC) + "% (25%) | TP3: " + str(TP3_PERC) + "% (10%) | TP4: " + str(TP4_PERC) + "% (15%)")
+    print("SL: " + str(SL_PERC) + "% | After TP1: SL->+" + str(SL_MOVE_AFTER_TP1) + "%")
+    print("Fee: " + str(FEE_RATE*100) + "% per side (MEXC API Futures)")
+    print("Excluded: " + str(len(EXCLUDED_COINS)) + " coins")
+    print("=" * 70)
+
+    top_coins = get_top_mexc_coins(TOP_N_COINS)
+    if not top_coins:
+        print("Failed to get coin list. Aborting.")
+        return None
+
+    print("")
+    print("Coins to test: " + ", ".join(top_coins[:5]) + "... (" + str(len(top_coins)) + " total)")
+
     indicator = SqueezeMomentumIndicator()
-    all_trades = []
-    processed = 0
+    all_signals = []
 
-    for symbol, df in data_map.items():
-        processed += 1
-        coin_trades = process_coin(symbol, df, indicator)
-        all_trades.extend(coin_trades)
-        if processed % 10 == 0 or processed == len(data_map):
-            print(f"  Processed {processed}/{len(data_map)} | Signals: {len(all_trades)}")
+    print("")
+    print("Fetching historical data (" + str(DAYS_BACK) + " days, " + TIMEFRAME + ")...")
+    print("-" * 70)
 
-    elapsed = time.time() - t0
-    print(f"\n  Completed in {elapsed:.1f}s")
+    for i, symbol in enumerate(top_coins):
+        print("[" + str(i+1).rjust(2) + "/" + str(len(top_coins)) + "] " + symbol.ljust(20) + " - ", end="", flush=True)
+        try:
+            df = get_historical_data(symbol, TIMEFRAME, DAYS_BACK)
+            if df.empty or len(df) < 50:
+                print("Insufficient data (" + str(len(df)) + " candles)")
+                continue
+            print("OK " + str(len(df)).rjust(5) + " candles - ", end="", flush=True)
+            df_signals = indicator.generate_signals(df)
+            signal_mask = df_signals['signal'] != 0
+            signal_rows = df_signals[signal_mask].copy()
+            if len(signal_rows) == 0:
+                print("No signals")
+                continue
+            print(str(len(signal_rows)).rjust(3) + " signals")
+            for idx, row in signal_rows.iterrows():
+                future_mask = df_signals.index > idx
+                df_future = df_signals[future_mask].copy()
+                if len(df_future) < 10:
+                    continue
+                signal_type = int(row['signal'])
+                entry_price = float(row['close'])
+                all_signals.append({
+                    'symbol': symbol, 'signal_time': idx,
+                    'signal_type': signal_type, 'entry_price': entry_price,
+                    'df_future': df_future.head(300)})
+        except Exception as e:
+            print("Error: " + str(e))
+            continue
 
-    if not all_trades:
-        print("\nNo trades found.")
-        return
+    print("")
+    print("=" * 70)
+    print("TOTAL SIGNALS COLLECTED: " + str(len(all_signals)))
+    print("=" * 70)
 
-    df_trades = pd.DataFrame(all_trades)
+    if len(all_signals) == 0:
+        print("No signals to backtest!")
+        return None
 
-    total_trades = len(df_trades)
-    winning = len(df_trades[df_trades['net_pnl'] > 0])
-    losing = len(df_trades[df_trades['net_pnl'] <= 0])
-    win_rate = (winning / total_trades * 100) if total_trades > 0 else 0
-    total_pnl = df_trades['net_pnl'].sum()
-    total_fees = df_trades['total_fees'].sum()
-    avg_pnl = df_trades['net_pnl'].mean()
-    avg_win = df_trades[df_trades['net_pnl'] > 0]['net_pnl'].mean() if winning > 0 else 0
-    avg_loss = df_trades[df_trades['net_pnl'] <= 0]['net_pnl'].mean() if losing > 0 else 0
-    max_win = df_trades['net_pnl'].max()
-    max_loss = df_trades['net_pnl'].min()
-    gross_win = df_trades[df_trades['net_pnl'] > 0]['net_pnl'].sum()
-    gross_loss = abs(df_trades[df_trades['net_pnl'] < 0]['net_pnl'].sum())
-    profit_factor = gross_win / gross_loss if gross_loss != 0 else float('inf')
+    engine = AdvancedBacktestEngine(INITIAL_BALANCE, RISK_PER_TRADE, LEVERAGE)
+    report = engine.run_backtest(all_signals)
 
-    exit_counts = df_trades['exit_reason'].value_counts()
-    tp1_hits = len(df_trades[df_trades['tp_hits'] >= 1])
-    tp2_hits = len(df_trades[df_trades['tp_hits'] >= 2])
-    tp3_hits = len(df_trades[df_trades['tp_hits'] >= 3])
-    tp4_hits = len(df_trades[df_trades['tp_hits'] >= 4])
-    sl_count = int(df_trades['sl_hit'].sum())
+    print("")
+    print("=" * 70)
+    print("BACKTEST RESULTS")
+    print("=" * 70)
+    print("Total Trades:       " + str(report['total_trades']))
+    print("Winning Trades:     " + str(report['winning_trades']) + " (" + str(round(report['win_rate'], 1)) + "%)")
+    print("Losing Trades:      " + str(report['losing_trades']) + " (" + str(round(100-report['win_rate'], 1)) + "%)")
+    print("Initial Balance:    " + str(round(report['initial_balance'], 2)) + " USDT")
+    print("Final Balance:      " + str(round(report['final_balance'], 2)) + " USDT")
+    print("Gross PnL:          " + ("+" if report['total_gross_pnl'] >= 0 else "") + str(round(report['total_gross_pnl'], 2)) + " USDT")
+    print("Total Fees:         " + str(round(report['total_fees'], 2)) + " USDT")
+    print("Net Return:         " + ("+" if report['total_return_pct'] >= 0 else "") + str(round(report['total_return_pct'], 2)) + "%")
+    print("Avg Net PnL/Trade:  " + ("+" if report['avg_net_pnl'] >= 0 else "") + str(round(report['avg_net_pnl'], 2)) + " USDT")
+    print("Avg Win:            " + ("+" if report['avg_win'] >= 0 else "") + str(round(report['avg_win'], 2)) + " USDT")
+    print("Avg Loss:           " + ("+" if report['avg_loss'] >= 0 else "") + str(round(report['avg_loss'], 2)) + " USDT")
+    print("Max Drawdown:       " + str(round(report['max_drawdown_pct'], 2)) + "%")
+    print("Profit Factor:      " + str(round(report['profit_factor'], 2)))
+    print("Expectancy:         " + str(round(report['expectancy'], 2)) + " USDT")
+    print("")
+    print("Exit Distribution:")
+    for exit_type, count in report['exit_distribution'].items():
+        print("  " + exit_type + ": " + str(count))
+    print("")
+    print("TP Hit Rates:")
+    for tp, count in report['tp_hits'].items():
+        print("  " + tp + ": " + str(count))
+    print("=" * 70)
 
-    buy_t = df_trades[df_trades['signal_type'] == 'BUY']
-    sell_t = df_trades[df_trades['signal_type'] == 'SELL']
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_filename = "backtest_advanced_" + timestamp + ".json"
+    with open(report_filename, 'w') as f:
+        json.dump(report, f, indent=2, default=str)
+    print("")
+    print("Report saved to: " + report_filename)
 
-    print("\n" + "=" * 60)
-    print("  BACKTEST RESULTS")
-    print("=" * 60)
-    print(f"  Total Trades:        {total_trades}")
-    print(f"  Winning:             {winning}  |  Losing: {losing}")
-    print(f"  Win Rate:            {win_rate:.1f}%")
-    print(f"  Profit Factor:       {profit_factor:.2f}")
-    print(f"  Total Net PnL:       ${total_pnl:.2f}")
-    print(f"  Total Fees:          ${total_fees:.2f}")
-    print(f"  Avg PnL/Trade:       ${avg_pnl:.2f}")
-    print(f"  Avg Win:             ${avg_win:.2f}  |  Avg Loss: ${avg_loss:.2f}")
-    print(f"  Max Win:             ${max_win:.2f}  |  Max Loss: ${max_loss:.2f}")
-    print(f"  ROI (100$/trade):    {total_pnl / (total_trades * 100) * 100:.2f}%")
-    print(f"  ROI (leveraged):     {total_pnl / (total_trades * 100) * 100 * LEVERAGE:.2f}%")
-    print("-" * 60)
-    print(f"  TP1 (0.8%):          {tp1_hits}/{total_trades} ({tp1_hits/total_trades*100:.1f}%)")
-    print(f"  TP2 (1.6%):          {tp2_hits}/{total_trades} ({tp2_hits/total_trades*100:.1f}%)")
-    print(f"  TP3 (3.0%):          {tp3_hits}/{total_trades} ({tp3_hits/total_trades*100:.1f}%)")
-    print(f"  TP4 (6.0%):          {tp4_hits}/{total_trades} ({tp4_hits/total_trades*100:.1f}%)")
-    print(f"  Stop Loss:           {sl_count}/{total_trades} ({sl_count/total_trades*100:.1f}%)")
-    print("-" * 60)
-    print(f"  BUY:  {len(buy_t)} trades (Avg: ${buy_t['net_pnl'].mean():.2f})" if len(buy_t) else "  BUY:  0 trades")
-    print(f"  SELL: {len(sell_t)} trades (Avg: ${sell_t['net_pnl'].mean():.2f})" if len(sell_t) else "  SELL: 0 trades")
-    print("-" * 60)
-    print("  Exit Reasons:")
-    for r, c in exit_counts.items():
-        print(f"    {r}: {c}")
-    print("=" * 60)
+    if TELEGRAM_TOKEN and CHANNEL_ID:
+        print("Sending report to Telegram...")
+        msg = format_report_telegram(report, DAYS_BACK, len(top_coins))
+        send_telegram_message(msg)
+        print("Telegram sent!")
 
-    # ==================== Save CSV ====================
-    output_path = 'backtest_results.csv'
-    df_trades.to_csv(output_path, index=False)
-    print(f"\n  Saved: {output_path}")
-
+    return report, engine
 
 if __name__ == "__main__":
-    run_backtest()
+    run_full_backtest()
