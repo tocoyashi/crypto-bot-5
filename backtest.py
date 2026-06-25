@@ -39,8 +39,8 @@ TP_LEVELS = [
     {'name': 'TP4', 'perc': 6.0,  'close_pct': 0.15},
 ]
 
-SL_PERC = 3.0
-SL_AFTER_TP1 = 0.25
+SL_PERC = 2.0
+SL_AFTER_TP1 = 0.60
 
 # ================= False Signal Filters =================
 MIN_SQUEEZE_BARS = 5
