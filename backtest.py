@@ -1,14 +1,12 @@
 """
-Backtest Script - Squeeze Momentum Strategy (Optimized v2)
-- Fixed datetime slicing
-- Filtered false signals (volume, momentum strength, squeeze duration, ATR)
-- Parallel data fetching for speed
-- Vectorized trade simulation
+Backtest Script - Squeeze Momentum Strategy (Optimized v3)
+- CSV output (no openpyxl needed)
+- Fixed false signals: SELL now requires squeeze release (like BUY)
+- Stronger filters for quality signals
 """
 
 import pandas as pd
 import numpy as np
-from scipy import stats
 import ccxt
 import time
 from datetime import datetime, timedelta
@@ -45,16 +43,16 @@ SL_PERC = 6.0
 SL_AFTER_TP1 = 0.10
 
 # ================= False Signal Filters =================
-MIN_SQUEEZE_BARS = 3          # Minimum squeeze duration (candles) before release
+MIN_SQUEEZE_BARS = 5          # Minimum squeeze duration (candles) before release
 MIN_MOMENTUM_STRENGTH = 0.0   # Minimum |momentum| value to accept signal
-MIN_VOLUME_RATIO = 1.0        # Signal candle volume must be > X * avg volume(20)
-MIN_ATR_PERCENTILE = 0        # ATR must be above this percentile (avoid dead markets)
+MIN_VOLUME_RATIO = 1.2        # Signal candle volume must be > X * avg volume(20)
+MIN_ATR_PERCENTILE = 15       # ATR must be above this percentile (avoid dead markets)
+MIN_TRADE_GAP = 60            # Minimum candles between trades on same coin
 
 # Backtest period
 END_DATE = datetime.utcnow()
 START_DATE = END_DATE - timedelta(days=30)
 
-# Exchange instance (reuse for all calls)
 _exchange = None
 
 
@@ -139,23 +137,29 @@ class SqueezeMomentumIndicator:
         atr_rank = data['atr_pct_rank']
         vol_r = data['vol_ratio']
 
-        buy_cond = (
-            sq &
-            (mom > MIN_MOMENTUM_STRENGTH) &
-            mi &
+        # Common filter: quality check
+        quality = (
             (sq_bars >= MIN_SQUEEZE_BARS) &
             (atr_rank > MIN_ATR_PERCENTILE / 100) &
             (vol_r > MIN_VOLUME_RATIO)
         )
 
+        # BUY: squeeze release + positive momentum + increasing + quality
+        buy_cond = (
+            sq &
+            (mom > MIN_MOMENTUM_STRENGTH) &
+            mi &
+            quality
+        )
+
+        # SELL: squeeze release + negative momentum + decreasing + quality
+        # (FIXED: SELL now also requires squeeze release like BUY)
         sell_cond = (
-            (
-                (mom < -MIN_MOMENTUM_STRENGTH) & (mom.shift(1).fillna(0) >= 0)
-            ) |
-            (
-                ~mi & ~mi.shift(1).fillna(True) & (mom > 0)
-            )
-        ) & (atr_rank > MIN_ATR_PERCENTILE / 100) & (vol_r > MIN_VOLUME_RATIO)
+            sq &
+            (mom < -MIN_MOMENTUM_STRENGTH) &
+            (~mi) &
+            quality
+        )
 
         data.loc[buy_cond, 'signal'] = 1
         data.loc[sell_cond, 'signal'] = -1
@@ -305,7 +309,7 @@ def _result(reason, idx, pnl, fees, tp_hits, sl_hit, sl_moved, details):
     }
 
 
-def process_coin(symbol, df, indicator, all_trades):
+def process_coin(symbol, df, indicator):
     trades = []
     try:
         df_sig = indicator.generate_signals(df)
@@ -324,7 +328,7 @@ def process_coin(symbol, df, indicator, all_trades):
             sig_type = df_sig.loc[sig_time, 'signal']
             entry = df_sig.loc[sig_time, 'close']
 
-            if (sig_idx - last_trade_idx) < 30:
+            if (sig_idx - last_trade_idx) < MIN_TRADE_GAP:
                 continue
 
             if sig_idx + 60 >= len(df_sig):
@@ -342,9 +346,9 @@ def process_coin(symbol, df, indicator, all_trades):
             trade = {
                 'symbol': symbol,
                 'signal_type': 'BUY' if sig_type == 1 else 'SELL',
-                'entry_timestamp': sig_time,
+                'entry_timestamp': str(sig_time),
                 'entry_price': entry,
-                'exit_timestamp': future.index[min(result['exit_idx'], len(future)-1)],
+                'exit_timestamp': str(future.index[min(result['exit_idx'], len(future)-1)]),
                 'exit_reason': result['exit_reason'],
                 'tp_hits': result['tp_hits'],
                 'sl_hit': result['sl_hit'],
@@ -372,7 +376,7 @@ def process_coin(symbol, df, indicator, all_trades):
 def run_backtest():
     t0 = time.time()
     print("=" * 60)
-    print("  BACKTEST v2 - Squeeze Momentum (Optimized)")
+    print("  BACKTEST v3 - Squeeze Momentum (Filtered)")
     print("=" * 60)
     print(f"  Period: {START_DATE.strftime('%Y-%m-%d')} to {END_DATE.strftime('%Y-%m-%d')}")
     print(f"  Timeframe: {TIMEFRAME} | Leverage: {LEVERAGE}x")
@@ -380,6 +384,7 @@ def run_backtest():
     print(f"  SL: {SL_PERC}% -> +{SL_AFTER_TP1}% after TP1")
     print(f"  MEXC Fee: {MEXC_TAKER_FEE*100:.3f}% (taker)")
     print(f"  Filters: squeeze>={MIN_SQUEEZE_BARS}bars, vol>{MIN_VOLUME_RATIO}x, ATR>{MIN_ATR_PERCENTILE}%ile")
+    print(f"  Min trade gap: {MIN_TRADE_GAP} candles ({MIN_TRADE_GAP*15/60:.1f}h)")
     print(f"  Excluded: {len(EXCLUDED_COINS)} coins")
     print("=" * 60)
 
@@ -416,10 +421,10 @@ def run_backtest():
 
     for symbol, df in data_map.items():
         processed += 1
-        coin_trades = process_coin(symbol, df, indicator, all_trades)
+        coin_trades = process_coin(symbol, df, indicator)
         all_trades.extend(coin_trades)
         if processed % 10 == 0 or processed == len(data_map):
-            print(f"  Processed {processed}/{len(data_map)} | Signals so far: {len(all_trades)}")
+            print(f"  Processed {processed}/{len(data_map)} | Signals: {len(all_trades)}")
 
     elapsed = time.time() - t0
     print(f"\n  Completed in {elapsed:.1f}s")
@@ -476,78 +481,17 @@ def run_backtest():
     print(f"  TP4 (6.0%):          {tp4_hits}/{total_trades} ({tp4_hits/total_trades*100:.1f}%)")
     print(f"  Stop Loss:           {sl_count}/{total_trades} ({sl_count/total_trades*100:.1f}%)")
     print("-" * 60)
-    print(f"  BUY:  {len(buy_t)} trades (Avg: ${buy_t['net_pnl'].mean():.2f})")
-    print(f"  SELL: {len(sell_t)} trades (Avg: ${sell_t['net_pnl'].mean():.2f})")
+    print(f"  BUY:  {len(buy_t)} trades (Avg: ${buy_t['net_pnl'].mean():.2f})" if len(buy_t) else "  BUY:  0 trades")
+    print(f"  SELL: {len(sell_t)} trades (Avg: ${sell_t['net_pnl'].mean():.2f})" if len(sell_t) else "  SELL: 0 trades")
     print("-" * 60)
     print("  Exit Reasons:")
     for r, c in exit_counts.items():
         print(f"    {r}: {c}")
     print("=" * 60)
 
-    output_path = 'backtest_results.xlsx'
-
-    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-        t_out = df_trades.copy()
-        t_out['entry_timestamp'] = t_out['entry_timestamp'].astype(str)
-        t_out['exit_timestamp'] = t_out['exit_timestamp'].astype(str)
-        t_out.to_excel(writer, sheet_name='Trades', index=False)
-
-        summary = pd.DataFrame({
-            'Metric': [
-                'Period', 'Timeframe', 'Leverage',
-                'Total Trades', 'Winning', 'Losing', 'Win Rate (%)',
-                'Profit Factor', 'Net PnL ($)', 'Fees ($)',
-                'Avg PnL ($)', 'Avg Win ($)', 'Avg Loss ($)',
-                'Max Win ($)', 'Max Loss ($)',
-                'ROI (%)', 'ROI Leverage (%)',
-                'TP1 Hit', 'TP2 Hit', 'TP3 Hit', 'TP4 Hit', 'SL Hit',
-                'BUY Trades', 'SELL Trades', 'BUY Avg ($)', 'SELL Avg ($)',
-                'Fee (%)', 'Speed (s)',
-                'Filter: Min Squeeze Bars', 'Filter: Min Vol Ratio',
-                'Filter: Min ATR Percentile',
-            ],
-            'Value': [
-                f"{START_DATE.strftime('%Y-%m-%d')} ~ {END_DATE.strftime('%Y-%m-%d')}",
-                TIMEFRAME, f"{LEVERAGE}x",
-                total_trades, winning, losing, f"{win_rate:.1f}",
-                f"{profit_factor:.2f}", f"${total_pnl:.2f}", f"${total_fees:.2f}",
-                f"${avg_pnl:.2f}", f"${avg_win:.2f}", f"${avg_loss:.2f}",
-                f"${max_win:.2f}", f"${max_loss:.2f}",
-                f"{total_pnl/(total_trades*100)*100:.2f}",
-                f"{total_pnl/(total_trades*100)*100*LEVERAGE:.2f}",
-                f"{tp1_hits}/{total_trades} ({tp1_hits/total_trades*100:.1f}%)",
-                f"{tp2_hits}/{total_trades} ({tp2_hits/total_trades*100:.1f}%)",
-                f"{tp3_hits}/{total_trades} ({tp3_hits/total_trades*100:.1f}%)",
-                f"{tp4_hits}/{total_trades} ({tp4_hits/total_trades*100:.1f}%)",
-                f"{sl_count}/{total_trades} ({sl_count/total_trades*100:.1f}%)",
-                len(buy_t), len(sell_t),
-                f"${buy_t['net_pnl'].mean():.2f}" if len(buy_t) else "$0",
-                f"${sell_t['net_pnl'].mean():.2f}" if len(sell_t) else "$0",
-                f"{MEXC_TAKER_FEE*100:.3f}%", f"{elapsed:.1f}",
-                MIN_SQUEEZE_BARS, MIN_VOLUME_RATIO, MIN_ATR_PERCENTILE,
-            ]
-        })
-        summary.to_excel(writer, sheet_name='Summary', index=False)
-
-        pd.DataFrame(
-            exit_counts.reset_index().values,
-            columns=['Exit Reason', 'Count']
-        ).to_excel(writer, sheet_name='Exit Reasons', index=False)
-
-        pd.DataFrame({
-            'Setting': [
-                'TP1 (%)', 'TP1 Close', 'TP2 (%)', 'TP2 Close',
-                'TP3 (%)', 'TP3 Close', 'TP4 (%)', 'TP4 Close',
-                'SL (%)', 'SL After TP1 (%)', 'Leverage', 'Fee (%)',
-                'Position ($)', 'Min Squeeze Bars', 'Min Vol Ratio', 'Min ATR %ile',
-            ],
-            'Value': [
-                '0.8', '50%', '1.6', '25%', '3.0', '10%', '6.0', '15%',
-                SL_PERC, SL_AFTER_TP1, f"{LEVERAGE}x", f"{MEXC_TAKER_FEE*100:.3f}",
-                '100', MIN_SQUEEZE_BARS, MIN_VOLUME_RATIO, MIN_ATR_PERCENTILE,
-            ]
-        }).to_excel(writer, sheet_name='Settings', index=False)
-
+    # ==================== Save CSV ====================
+    output_path = 'backtest_results.csv'
+    df_trades.to_csv(output_path, index=False)
     print(f"\n  Saved: {output_path}")
 
 
