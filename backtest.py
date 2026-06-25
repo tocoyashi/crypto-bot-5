@@ -1,8 +1,9 @@
 """
-Backtest Script - Squeeze Momentum Strategy (v4)
+Backtest Script - Squeeze Momentum Strategy (Optimized v3)
+- 35 عملة مُحسّنة لـ Squeeze Momentum
 - CSV output (no openpyxl needed)
-- SELL requires squeeze release
-- Optimized TP/SL levels
+- Fixed false signals: SELL now requires squeeze release (like BUY)
+- Stronger filters for quality signals
 """
 
 import pandas as pd
@@ -16,38 +17,77 @@ warnings.filterwarnings('ignore')
 
 # ================= Settings =================
 TIMEFRAME = '15m'
-TOP_N_COINS = 50
+TOP_N_COINS = 35
 LEVERAGE = 10
 
 # MEXC Futures Taker Fee
 MEXC_TAKER_FEE = 0.0002  # 0.02%
 
-# Excluded coins
-EXCLUDED_COINS = [
-    'SPACEX(PRE)/USDT', 'RAIN/USDT', 'TOYL/USDT', 'WXT/USDT',
-    'UPC/USDT', 'DN/USDT', 'AIXPLAY/USDT', 'MBG/USDT',
-    'KAZAR/USDT', 'STAR/USDT'
+# ========== 35 عملة مُحسّنة لـ Squeeze Momentum ==========
+# محذوفة: TRX, LTC, XLM, ETC, POL, TIA, FIL, ORDI, KAS, MINA, JTO, BLUR, API3, W
+# محذوفة أيضاً: العملات المستبعدة والمستقرة
+SYMBOLS = [
+    # Tier 1: تقلب عالي + سيولة ضخمة (الأفضل للـ Squeeze)
+    "BTC/USDT",      # الملك - تقلب ممتاز
+    "ETH/USDT",      # ثاني أكبر - سيولة عالية
+    "SOL/USDT",      # تقلب ممتاز - Squeeze متكرر
+    "DOGE/USDT",     # تقلب مجنون - مثالي للـ Squeeze
+    "SHIB/USDT",     # نفس DOGE - تقلب عالي
+    
+    # Tier 2: تقلب جيد + سيولة عالية
+    "XRP/USDT",      # سيولة ضخمة - تقلب متوسط
+    "ADA/USDT",      # تقلب جيد - Squeeze واضح
+    "AVAX/USDT",     # تقلب عالي - ممتاز للـ Squeeze
+    "LINK/USDT",     # تقلب جيد - سيولة عالية
+    "DOT/USDT",      # تقلب متوسط - Squeeze متكرر
+    "UNI/USDT",      # DeFi - تقلب عالي
+    "ATOM/USDT",     # تقلب جيد - Cosmos ecosystem
+    "NEAR/USDT",     # تقلب عالي - Squeeze ممتاز
+    "APT/USDT",      # تقلب جيد - Move ecosystem
+    "SUI/USDT",      # تقلب عالي - Squeeze متكرر
+    
+    # Tier 3: Meme + تقلب عالي (ممتاز للـ Squeeze)
+    "PEPE/USDT",     # Meme - تقلب مجنون
+    "FLOKI/USDT",    # Meme - Squeeze متكرر
+    "WIF/USDT",      # Meme - تقلب عالي
+    "BONK/USDT",     # Meme - تقلب ممتاز
+    "FET/USDT",      # AI narrative - تقلب جيد
+    
+    # Tier 4: Altcoins متوسطة - تقلب جيد
+    "ARB/USDT",      # L2 - تقلب متوسط
+    "OP/USDT",       # L2 - Squeeze واضح
+    "INJ/USDT",      # DeFi - تقلب عالي
+    "AAVE/USDT",     # DeFi - سيولة جيدة
+    "GRT/USDT",      # Data - تقلب متوسط
+    "SEI/USDT",      # Trading - تقلب جيد
+    "ICP/USDT",      # Web3 - تقلب متوسط
+    "WLD/USDT",      # AI - تقلب عالي
+    "IMX/USDT",      # Gaming - تقلب جيد
+    "RENDER/USDT",   # GPU - تقلب متوسط
+    "JUP/USDT",      # DEX - تقلب جيد
+    "STRK/USDT",     # L2 - تقلب متوسط
+    "ONDO/USDT",     # RWA - تقلب جيد
+    "PYTH/USDT",     # Oracle - تقلب متوسط
+    "ENA/USDT",      # Stablecoin - تقلب عالي
 ]
-
-STABLECOINS = ['USDC/USDT', 'TUSD/USDT', 'DAI/USDT', 'FDUSD/USDT', 'USDP/USDT', 'PYUSD/USDT']
 
 # TP levels with partial close percentages
 TP_LEVELS = [
-    {'name': 'TP1', 'perc': 1.2,  'close_pct': 0.50},
-    {'name': 'TP2', 'perc': 2.3,  'close_pct': 0.25},
-    {'name': 'TP3', 'perc': 4.0,  'close_pct': 0.10},
+    {'name': 'TP1', 'perc': 0.8,  'close_pct': 0.50},
+    {'name': 'TP2', 'perc': 1.6,  'close_pct': 0.25},
+    {'name': 'TP3', 'perc': 3.0,  'close_pct': 0.10},
     {'name': 'TP4', 'perc': 6.0,  'close_pct': 0.15},
 ]
 
-SL_PERC = 3.0
-SL_AFTER_TP1 = 0.25
+SL_PERC = 6.0
+SL_AFTER_TP1 = 0.10
 
 # ================= False Signal Filters =================
-MIN_SQUEEZE_BARS = 5
-MIN_MOMENTUM_STRENGTH = 0.0
-MIN_VOLUME_RATIO = 1.2
-MIN_ATR_PERCENTILE = 15
-MIN_TRADE_GAP = 60
+MIN_SQUEEZE_BARS = 5          # Minimum squeeze duration (candles) before release
+MIN_MOMENTUM_STRENGTH = 0.0   # Minimum |momentum| value to accept signal
+MIN_VOLUME_RATIO = 1.2        # Signal candle volume must be > X * avg volume(20)
+MIN_ATR_PERCENTILE = 15       # ATR must be above this percentile (avoid dead markets)
+MIN_TRADE_GAP = 60            # Minimum candles between trades on same coin
 
 # Backtest period
 END_DATE = datetime.utcnow()
@@ -137,14 +177,29 @@ class SqueezeMomentumIndicator:
         atr_rank = data['atr_pct_rank']
         vol_r = data['vol_ratio']
 
+        # Common filter: quality check
         quality = (
             (sq_bars >= MIN_SQUEEZE_BARS) &
             (atr_rank > MIN_ATR_PERCENTILE / 100) &
             (vol_r > MIN_VOLUME_RATIO)
         )
 
-        buy_cond = sq & (mom > MIN_MOMENTUM_STRENGTH) & mi & quality
-        sell_cond = sq & (mom < -MIN_MOMENTUM_STRENGTH) & (~mi) & quality
+        # BUY: squeeze release + positive momentum + increasing + quality
+        buy_cond = (
+            sq &
+            (mom > MIN_MOMENTUM_STRENGTH) &
+            mi &
+            quality
+        )
+
+        # SELL: squeeze release + negative momentum + decreasing + quality
+        # (FIXED: SELL now also requires squeeze release like BUY)
+        sell_cond = (
+            sq &
+            (mom < -MIN_MOMENTUM_STRENGTH) &
+            (~mi) &
+            quality
+        )
 
         data.loc[buy_cond, 'signal'] = 1
         data.loc[sell_cond, 'signal'] = -1
@@ -361,40 +416,29 @@ def process_coin(symbol, df, indicator):
 def run_backtest():
     t0 = time.time()
     print("=" * 60)
-    print("  BACKTEST v4 - Squeeze Momentum (Optimized TP/SL)")
+    print("  BACKTEST v3 - Squeeze Momentum (35 Coins Optimized)")
     print("=" * 60)
     print(f"  Period: {START_DATE.strftime('%Y-%m-%d')} to {END_DATE.strftime('%Y-%m-%d')}")
     print(f"  Timeframe: {TIMEFRAME} | Leverage: {LEVERAGE}x")
-    print(f"  TP: 1.2%(50%), 2.3%(25%), 4%(10%), 6%(15%)")
+    print(f"  Coins: {len(SYMBOLS)} optimized for Squeeze Momentum")
+    print(f"  TP: 0.8%(50%), 1.6%(25%), 3%(10%), 6%(15%)")
     print(f"  SL: {SL_PERC}% -> +{SL_AFTER_TP1}% after TP1")
     print(f"  MEXC Fee: {MEXC_TAKER_FEE*100:.3f}% (taker)")
     print(f"  Filters: squeeze>={MIN_SQUEEZE_BARS}bars, vol>{MIN_VOLUME_RATIO}x, ATR>{MIN_ATR_PERCENTILE}%ile")
     print(f"  Min trade gap: {MIN_TRADE_GAP} candles ({MIN_TRADE_GAP*15/60:.1f}h)")
-    print(f"  Excluded: {len(EXCLUDED_COINS)} coins")
     print("=" * 60)
 
     start_ms = int(START_DATE.timestamp() * 1000)
     end_ms = int(END_DATE.timestamp() * 1000)
 
-    print("\n[1/3] Fetching top coins...")
-    exchange = get_exchange()
-    try:
-        tickers = exchange.fetch_tickers()
-        usdt_pairs = []
-        for symbol, ticker in tickers.items():
-            if symbol.endswith('/USDT') and symbol not in STABLECOINS and symbol not in EXCLUDED_COINS:
-                vol = ticker.get('quoteVolume') or 0
-                if vol > 1000000:
-                    usdt_pairs.append({'symbol': symbol, 'volume': vol})
-        usdt_pairs.sort(key=lambda x: x['volume'], reverse=True)
-        top_coins = [p['symbol'] for p in usdt_pairs[:TOP_N_COINS]]
-        print(f"  Found {len(top_coins)} coins")
-    except Exception as e:
-        print(f"  [ERROR] {e}")
-        return
+    print(f"\n[1/3] Loading {len(SYMBOLS)} optimized coins...")
+    print("  Tier 1: BTC, ETH, SOL, DOGE, SHIB (High Volatility)")
+    print("  Tier 2: XRP, ADA, AVAX, LINK, DOT, UNI, ATOM, NEAR, APT, SUI (Good Volatility)")
+    print("  Tier 3: PEPE, FLOKI, WIF, BONK, FET (Meme + AI)")
+    print("  Tier 4: ARB, OP, INJ, AAVE, GRT, SEI, ICP, WLD, IMX, RENDER, JUP, STRK, ONDO, PYTH, ENA (Altcoins)")
 
     print(f"\n[2/3] Fetching OHLCV data (parallel)...")
-    data_map = fetch_all_data_parallel(top_coins, start_ms, end_ms, max_workers=8)
+    data_map = fetch_all_data_parallel(SYMBOLS, start_ms, end_ms, max_workers=8)
     if not data_map:
         print("No valid data. Aborting.")
         return
@@ -460,9 +504,9 @@ def run_backtest():
     print(f"  ROI (100$/trade):    {total_pnl / (total_trades * 100) * 100:.2f}%")
     print(f"  ROI (leveraged):     {total_pnl / (total_trades * 100) * 100 * LEVERAGE:.2f}%")
     print("-" * 60)
-    print(f"  TP1 (1.2%):          {tp1_hits}/{total_trades} ({tp1_hits/total_trades*100:.1f}%)")
-    print(f"  TP2 (2.3%):          {tp2_hits}/{total_trades} ({tp2_hits/total_trades*100:.1f}%)")
-    print(f"  TP3 (4.0%):          {tp3_hits}/{total_trades} ({tp3_hits/total_trades*100:.1f}%)")
+    print(f"  TP1 (0.8%):          {tp1_hits}/{total_trades} ({tp1_hits/total_trades*100:.1f}%)")
+    print(f"  TP2 (1.6%):          {tp2_hits}/{total_trades} ({tp2_hits/total_trades*100:.1f}%)")
+    print(f"  TP3 (3.0%):          {tp3_hits}/{total_trades} ({tp3_hits/total_trades*100:.1f}%)")
     print(f"  TP4 (6.0%):          {tp4_hits}/{total_trades} ({tp4_hits/total_trades*100:.1f}%)")
     print(f"  Stop Loss:           {sl_count}/{total_trades} ({sl_count/total_trades*100:.1f}%)")
     print("-" * 60)
@@ -474,7 +518,8 @@ def run_backtest():
         print(f"    {r}: {c}")
     print("=" * 60)
 
-    output_path = 'backtest_results.csv'
+    # ==================== Save CSV ====================
+    output_path = 'backtest_results_35coins.csv'
     df_trades.to_csv(output_path, index=False)
     print(f"\n  Saved: {output_path}")
 
