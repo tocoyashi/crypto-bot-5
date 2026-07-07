@@ -1,14 +1,14 @@
 """
-Backtest Script - Squeeze Momentum Strategy (v5)
-- CSV output (no openpyxl needed)
-- SELL requires squeeze release
-- EMA 200 trend filter
-- RSI momentum filter
-- Optimized TP/SL levels
+Backtest Script - Squeeze Momentum Strategy (v6)
+- Synced with bot.py (exact same signal logic)
+- Cooldown support (4h per coin)
+- Top 25 coins
+- CSV output
 """
 
 import pandas as pd
 import numpy as np
+from scipy import stats
 import ccxt
 import time
 from datetime import datetime, timedelta
@@ -16,9 +16,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings('ignore')
 
-# ================= Settings =================
+# ================= Settings (synced with bot.py) =================
 TIMEFRAME = '15m'
-TOP_N_COINS = 50
+TOP_N_COINS = 25
 LEVERAGE = 10
 
 # MEXC Futures Taker Fee
@@ -33,23 +33,20 @@ EXCLUDED_COINS = [
 
 STABLECOINS = ['USDC/USDT', 'TUSD/USDT', 'DAI/USDT', 'FDUSD/USDT', 'USDP/USDT', 'PYUSD/USDT']
 
-# TP levels with partial close percentages
+# TP levels with partial close percentages (same logic as bot.py TP targets)
 TP_LEVELS = [
-    {'name': 'TP1', 'perc': 1.2,  'close_pct': 0.50},
-    {'name': 'TP2', 'perc': 2.3,  'close_pct': 0.25},
-    {'name': 'TP3', 'perc': 4.0,  'close_pct': 0.10},
-    {'name': 'TP4', 'perc': 6.0,  'close_pct': 0.15},
+    {'name': 'TP1', 'perc': 0.6,  'close_pct': 0.30},
+    {'name': 'TP2', 'perc': 1.5,  'close_pct': 0.25},
+    {'name': 'TP3', 'perc': 2.4,  'close_pct': 0.20},
+    {'name': 'TP4', 'perc': 5.0,  'close_pct': 0.15},
+    {'name': 'TP5', 'perc': 7.0,  'close_pct': 0.05},
+    {'name': 'TP6', 'perc': 9.0,  'close_pct': 0.05},
 ]
 
-SL_PERC = 2.0
-SL_AFTER_TP1 = 0.60
+SL_PERC = 6.0
 
-# ================= False Signal Filters =================
-MIN_SQUEEZE_BARS = 5
-MIN_MOMENTUM_STRENGTH = 0.0
-MIN_VOLUME_RATIO = 1.2
-MIN_ATR_PERCENTILE = 15
-MIN_TRADE_GAP = 60
+# ================= Cooldown Settings (synced with bot.py) =================
+COOLDOWN_HOURS = 4
 
 # Backtest period
 END_DATE = datetime.utcnow()
@@ -65,6 +62,7 @@ def get_exchange():
     return _exchange
 
 
+# ================= Same indicator class as bot.py =================
 class SqueezeMomentumIndicator:
     def __init__(self, bb_length=20, bb_mult=2.0, kc_length=20, kc_mult=1.5):
         self.bb_length = bb_length
@@ -72,70 +70,45 @@ class SqueezeMomentumIndicator:
         self.kc_length = kc_length
         self.kc_mult = kc_mult
 
-    def rsi(self, series, period=14):
-        delta = series.diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = (-delta).where(delta < 0, 0.0)
-        avg_gain = gain.rolling(window=period).mean()
-        avg_loss = loss.rolling(window=period).mean()
-        rs = avg_gain / avg_loss
-        return 100 - (100 / (1 + rs))
+    def true_range(self, high, low, close):
+        tr1 = high - low
+        tr2 = abs(high - close.shift(1))
+        tr3 = abs(low - close.shift(1))
+        return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    def linear_regression(self, series, length):
+        def linreg_single(x):
+            if len(x) < length: return np.nan
+            y = np.arange(len(x))
+            slope, intercept, _, _, _ = stats.linregress(y, x)
+            return slope * (len(x) - 1) + intercept
+        return series.rolling(window=length).apply(linreg_single, raw=False)
 
     def calculate_indicators(self, df):
         data = df.copy()
-        c, h, l = data['close'], data['high'], data['low']
 
-        bb_basis = c.rolling(self.bb_length).mean()
-        bb_dev = self.bb_mult * c.rolling(self.bb_length).std()
+        bb_basis = data['close'].rolling(window=self.bb_length).mean()
+        bb_dev = self.bb_mult * data['close'].rolling(window=self.bb_length).std()
         upper_bb = bb_basis + bb_dev
         lower_bb = bb_basis - bb_dev
 
-        kc_ma = c.rolling(self.kc_length).mean()
-        tr = pd.concat([h - l, (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1)
-        range_ma = tr.rolling(self.kc_length).mean()
+        kc_ma = data['close'].rolling(window=self.kc_length).mean()
+        tr = self.true_range(data['high'], data['low'], data['close'])
+        range_ma = tr.rolling(window=self.kc_length).mean()
         upper_kc = kc_ma + range_ma * self.kc_mult
         lower_kc = kc_ma - range_ma * self.kc_mult
 
         squeeze_on = (lower_bb > lower_kc) & (upper_bb < upper_kc)
 
-        squeeze_duration = (~squeeze_on).cumsum()
-        squeeze_bars = squeeze_on.groupby(squeeze_duration).cumsum()
-
-        hh = h.rolling(self.kc_length).max()
-        ll = l.rolling(self.kc_length).min()
-        cm = c.rolling(self.kc_length).mean()
-        avg_val = ((hh + ll) / 2 + cm) / 2
-        diff = c - avg_val
-
-        def _linreg(s, w):
-            x = np.arange(w)
-            x_mean = x.mean()
-            x_var = ((x - x_mean) ** 2).sum()
-            def _apply(y):
-                if len(y) < w or np.any(np.isnan(y)):
-                    return np.nan
-                y_c = y - y.mean()
-                return np.dot(x - x_mean, y_c) / x_var * (w - 1) + y_c[-1]
-            return s.rolling(w).apply(_apply, raw=True)
-
-        momentum = _linreg(diff, self.kc_length)
-
-        atr = tr.rolling(14).mean()
-        atr_pct = atr / c * 100
-
-        vol_ma = data['volume'].rolling(20).mean()
-        vol_ratio = data['volume'] / vol_ma
+        highest_high = data['high'].rolling(window=self.kc_length).max()
+        lowest_low = data['low'].rolling(window=self.kc_length).min()
+        close_ma = data['close'].rolling(window=self.kc_length).mean()
+        avg_val = ((highest_high + lowest_low) / 2 + close_ma) / 2
+        momentum = self.linear_regression(data['close'] - avg_val, self.kc_length)
 
         data['squeeze_on'] = squeeze_on
-        data['squeeze_bars'] = squeeze_bars
-        data['squeeze_release'] = squeeze_on.shift(1).fillna(False) & ~squeeze_on
         data['momentum'] = momentum
         data['momentum_increasing'] = momentum > momentum.shift(1)
-        data['atr_pct'] = atr_pct
-        data['atr_pct_rank'] = atr_pct.rolling(100).rank(pct=True)
-        data['vol_ratio'] = vol_ratio
-        data['ema_200'] = c.ewm(span=200, adjust=False).mean()
-        data['rsi'] = self.rsi(c, 14)
 
         return data
 
@@ -143,30 +116,25 @@ class SqueezeMomentumIndicator:
         data = self.calculate_indicators(df)
         data['signal'] = 0
 
-        sq = data['squeeze_release']
-        mom = data['momentum']
-        mi = data['momentum_increasing'].fillna(False)
-        sq_bars = data['squeeze_bars'].shift(1).fillna(0)
-        atr_rank = data['atr_pct_rank']
-        vol_r = data['vol_ratio']
+        squeeze_on_safe = data['squeeze_on'].fillna(False).astype(bool)
+        mom_inc_safe = data['momentum_increasing'].fillna(False).astype(bool)
 
-        ema_ok_buy = data['close'] > data['ema_200']
-        ema_ok_sell = data['close'] < data['ema_200']
-        rsi_safe = data['rsi'].fillna(50)
-        rsi_ok_buy = rsi_safe < 70
-        rsi_ok_sell = rsi_safe > 30
+        data['squeeze_release'] = (squeeze_on_safe.shift(1) == True) & (squeeze_on_safe == False)
 
-        quality = (
-            (sq_bars >= MIN_SQUEEZE_BARS) &
-            (atr_rank > MIN_ATR_PERCENTILE / 100) &
-            (vol_r > MIN_VOLUME_RATIO)
+        buy_cond = (
+            (data['squeeze_release'] == True) &
+            (data['momentum'] > 0) &
+            (mom_inc_safe == True)
         )
 
-        buy_cond = sq & (mom > MIN_MOMENTUM_STRENGTH) & mi & quality & ema_ok_buy & rsi_ok_buy
-        sell_cond = sq & (mom < -MIN_MOMENTUM_STRENGTH) & (~mi) & quality & ema_ok_sell & rsi_ok_sell
+        sell_cond = (
+            ((data['momentum'] < 0) & (data['momentum'].shift(1).fillna(0) >= 0)) |
+            ((mom_inc_safe == False) & (mom_inc_safe.shift(1).fillna(True) == False) & (data['momentum'] > 0))
+        )
 
         data.loc[buy_cond, 'signal'] = 1
         data.loc[sell_cond, 'signal'] = -1
+
         return data
 
 
@@ -222,12 +190,12 @@ def fetch_all_data_parallel(coins, start_ms, end_ms, max_workers=5):
             if done % 10 == 0:
                 print(f"    Fetched {done}/{len(coins)}...")
 
-    valid = {k: v for k, v in results.items() if len(v) >= 200}
+    valid = {k: v for k, v in results.items() if len(v) >= 100}
     print(f"  Valid data: {len(valid)}/{len(coins)} coins")
     return valid
 
 
-def simulate_trade_vectorized(entry_price, signal_type, highs, lows):
+def simulate_trade(entry_price, signal_type, highs, lows):
     direction = 1 if signal_type == 1 else -1
 
     tp_prices = np.array([
@@ -235,21 +203,20 @@ def simulate_trade_vectorized(entry_price, signal_type, highs, lows):
     ])
 
     sl_price = entry_price * (1 - direction * SL_PERC / 100)
-    new_sl = entry_price * (1 + direction * SL_AFTER_TP1 / 100)
 
     position_usdt = 100.0
     remaining_pct = 1.0
     open_fee = position_usdt * MEXC_TAKER_FEE
     total_pnl = 0.0
     total_fees = open_fee
-    tp_hits = [False] * 4
-    sl_moved = False
+    tp_hits = [False] * len(TP_LEVELS)
     closed_amounts = []
     exit_reason = "Timeout"
     exit_idx = len(highs) - 1
 
     for i in range(len(highs)):
-        for j in range(4):
+        # Check TPs
+        for j in range(len(TP_LEVELS)):
             if tp_hits[j]:
                 continue
             hit = (direction == 1 and highs[i] >= tp_prices[j]) or \
@@ -267,14 +234,12 @@ def simulate_trade_vectorized(entry_price, signal_type, highs, lows):
                     'tp': TP_LEVELS[j]['name'], 'price': tp_prices[j],
                     'pct_closed': cp, 'pnl': pnl - cf, 'fee': cf, 'idx': i
                 })
-                if j == 0 and not sl_moved:
-                    sl_moved = True
-                    sl_price = new_sl
                 if remaining_pct <= 0.001:
                     exit_reason = f"TP{j+1} (All closed)"
                     exit_idx = i
-                    return _result(exit_reason, i, total_pnl, total_fees, tp_hits, False, sl_moved, closed_amounts)
+                    return _result(exit_reason, i, total_pnl, total_fees, tp_hits, False, closed_amounts)
 
+        # Check SL
         sl_hit = (direction == 1 and lows[i] <= sl_price) or \
                  (direction == -1 and highs[i] >= sl_price)
         if sl_hit and remaining_pct > 0.001:
@@ -287,8 +252,9 @@ def simulate_trade_vectorized(entry_price, signal_type, highs, lows):
                 'tp': 'SL', 'price': sl_price,
                 'pct_closed': remaining_pct, 'pnl': pnl - cf, 'fee': cf, 'idx': i
             })
-            return _result("Stop Loss", i, total_pnl, total_fees, tp_hits, True, sl_moved, closed_amounts)
+            return _result("Stop Loss", i, total_pnl, total_fees, tp_hits, True, closed_amounts)
 
+    # Timeout - close remaining at last price
     if remaining_pct > 0.001:
         last_p = (highs[-1] + lows[-1]) / 2
         cu = position_usdt * remaining_pct
@@ -301,15 +267,15 @@ def simulate_trade_vectorized(entry_price, signal_type, highs, lows):
             'pct_closed': remaining_pct, 'pnl': pnl - cf, 'fee': cf, 'idx': exit_idx
         })
 
-    return _result(exit_reason, exit_idx, total_pnl, total_fees, tp_hits, False, sl_moved, closed_amounts)
+    return _result(exit_reason, exit_idx, total_pnl, total_fees, tp_hits, False, closed_amounts)
 
 
-def _result(reason, idx, pnl, fees, tp_hits, sl_hit, sl_moved, details):
+def _result(reason, idx, pnl, fees, tp_hits, sl_hit, details):
     return {
         'exit_reason': reason, 'exit_idx': idx,
         'total_pnl': pnl, 'total_fees': fees, 'net_pnl': pnl,
         'tp_hits': sum(tp_hits), 'sl_hit': sl_hit,
-        'sl_moved': sl_moved, 'tp_details': details
+        'tp_details': details
     }
 
 
@@ -325,15 +291,18 @@ def process_coin(symbol, df, indicator):
         cutoff = df_sig.index[-30]
         signals = signals[signals < cutoff]
 
-        last_trade_idx = -9999
+        cooldown_until = None
+        cooldown_skipped = 0
 
         for sig_time in signals:
+            # Cooldown check
+            if cooldown_until is not None and sig_time < cooldown_until:
+                cooldown_skipped += 1
+                continue
+
             sig_idx = df_sig.index.get_loc(sig_time)
             sig_type = df_sig.loc[sig_time, 'signal']
             entry = df_sig.loc[sig_time, 'close']
-
-            if (sig_idx - last_trade_idx) < MIN_TRADE_GAP:
-                continue
 
             if sig_idx + 60 >= len(df_sig):
                 continue
@@ -345,7 +314,10 @@ def process_coin(symbol, df, indicator):
             highs = future['high'].values
             lows = future['low'].values
 
-            result = simulate_trade_vectorized(entry, sig_type, highs, lows)
+            result = simulate_trade(entry, sig_type, highs, lows)
+
+            # Set cooldown after taking a trade
+            cooldown_until = sig_time + timedelta(hours=COOLDOWN_HOURS)
 
             trade = {
                 'symbol': symbol,
@@ -356,20 +328,18 @@ def process_coin(symbol, df, indicator):
                 'exit_reason': result['exit_reason'],
                 'tp_hits': result['tp_hits'],
                 'sl_hit': result['sl_hit'],
-                'sl_moved': result['sl_moved'],
                 'total_pnl_pct': (result['net_pnl'] / 100) * 100 * LEVERAGE,
                 'total_fees': result['total_fees'],
                 'net_pnl': result['net_pnl'],
             }
 
-            for k in range(4):
+            for k in range(len(TP_LEVELS)):
                 tp_name = TP_LEVELS[k]['name']
                 tp_match = [d for d in result['tp_details'] if d['tp'] == tp_name]
                 trade[f'{tp_name}_price'] = tp_match[0]['price'] if tp_match else None
                 trade[f'{tp_name}_pnl'] = tp_match[0]['pnl'] if tp_match else None
 
             trades.append(trade)
-            last_trade_idx = sig_idx
 
     except Exception as e:
         print(f"    [WARN] {symbol}: {e}")
@@ -380,17 +350,17 @@ def process_coin(symbol, df, indicator):
 def run_backtest():
     t0 = time.time()
     print("=" * 60)
-    print("  BACKTEST v5 - Squeeze Momentum + EMA200 + RSI")
+    print("  BACKTEST v6 - Synced with bot.py")
     print("=" * 60)
     print(f"  Period: {START_DATE.strftime('%Y-%m-%d')} to {END_DATE.strftime('%Y-%m-%d')}")
     print(f"  Timeframe: {TIMEFRAME} | Leverage: {LEVERAGE}x")
-    print(f"  TP: 1.2%(50%), 2.3%(25%), 4%(10%), 6%(15%)")
-    print(f"  SL: {SL_PERC}% -> +{SL_AFTER_TP1}% after TP1")
+    print(f"  Coins: Top {TOP_N_COINS}")
+    print(f"  SL: {SL_PERC}% (matches bot.py)")
+    tp_info = ", ".join([f"{tp['name']}({tp['perc']}%/{int(tp['close_pct']*100)}%)" for tp in TP_LEVELS])
+    print(f"  TP: {tp_info}")
     print(f"  MEXC Fee: {MEXC_TAKER_FEE*100:.3f}% (taker)")
-    print(f"  Filters: squeeze>={MIN_SQUEEZE_BARS}bars, vol>{MIN_VOLUME_RATIO}x, ATR>{MIN_ATR_PERCENTILE}%ile")
-    print(f"  Trend: EMA200 (BUY above, SELL below)")
-    print(f"  Momentum: RSI<70 for BUY, RSI>30 for SELL")
-    print(f"  Min trade gap: {MIN_TRADE_GAP} candles ({MIN_TRADE_GAP*15/60:.1f}h)")
+    print(f"  Cooldown: {COOLDOWN_HOURS}h per coin (matches bot.py)")
+    print(f"  Signal logic: Exact copy from bot.py (no extra filters)")
     print(f"  Excluded: {len(EXCLUDED_COINS)} coins")
     print("=" * 60)
 
@@ -457,10 +427,6 @@ def run_backtest():
     profit_factor = gross_win / gross_loss if gross_loss != 0 else float('inf')
 
     exit_counts = df_trades['exit_reason'].value_counts()
-    tp1_hits = len(df_trades[df_trades['tp_hits'] >= 1])
-    tp2_hits = len(df_trades[df_trades['tp_hits'] >= 2])
-    tp3_hits = len(df_trades[df_trades['tp_hits'] >= 3])
-    tp4_hits = len(df_trades[df_trades['tp_hits'] >= 4])
     sl_count = int(df_trades['sl_hit'].sum())
 
     buy_t = df_trades[df_trades['signal_type'] == 'BUY']
@@ -481,10 +447,10 @@ def run_backtest():
     print(f"  ROI (100$/trade):    {total_pnl / (total_trades * 100) * 100:.2f}%")
     print(f"  ROI (leveraged):     {total_pnl / (total_trades * 100) * 100 * LEVERAGE:.2f}%")
     print("-" * 60)
-    print(f"  TP1 (1.2%):          {tp1_hits}/{total_trades} ({tp1_hits/total_trades*100:.1f}%)")
-    print(f"  TP2 (2.3%):          {tp2_hits}/{total_trades} ({tp2_hits/total_trades*100:.1f}%)")
-    print(f"  TP3 (4.0%):          {tp3_hits}/{total_trades} ({tp3_hits/total_trades*100:.1f}%)")
-    print(f"  TP4 (6.0%):          {tp4_hits}/{total_trades} ({tp4_hits/total_trades*100:.1f}%)")
+    for k in range(len(TP_LEVELS)):
+        tp_name = TP_LEVELS[k]['name']
+        tp_hits = len(df_trades[df_trades['tp_hits'] >= k + 1])
+        print(f"  {tp_name} ({TP_LEVELS[k]['perc']}%):  {tp_hits}/{total_trades} ({tp_hits/total_trades*100:.1f}%)")
     print(f"  Stop Loss:           {sl_count}/{total_trades} ({sl_count/total_trades*100:.1f}%)")
     print("-" * 60)
     print(f"  BUY:  {len(buy_t)} trades (Avg: ${buy_t['net_pnl'].mean():.2f})" if len(buy_t) else "  BUY:  0 trades")
