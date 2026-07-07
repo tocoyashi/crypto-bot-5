@@ -5,7 +5,9 @@ import ccxt
 import requests
 import os
 import time
+import json
 from datetime import datetime
+from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -15,7 +17,7 @@ CHANNEL_ID = os.environ.get('CHANNEL_ID')
 
 # ================= Trading Settings =================
 TIMEFRAME = '15m'      
-TOP_N_COINS = 50       
+TOP_N_COINS = 25       
 STABLECOINS = ['USDC/USDT', 'TUSD/USDT', 'DAI/USDT', 'FDUSD/USDT', 'USDP/USDT', 'PYUSD/USDT']
 
 # ================= Risk Management Settings =================
@@ -27,6 +29,10 @@ TP4_PERC = 5.0
 TP5_PERC = 7.0
 TP6_PERC = 9.0
 SL_PERC = 6.0
+
+# ================= Cooldown Settings =================
+COOLDOWN_FILE = Path('cooldown.json')
+COOLDOWN_HOURS = 4
 
 def calculate_targets(entry_price, signal_type):
     """Calculates TP and SL prices based on signal type (1 = BUY, -1 = SELL)"""
@@ -75,15 +81,6 @@ class SqueezeMomentumIndicator:
         tr3 = abs(low - close.shift(1))
         return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-    def rsi(self, series, period=14):
-        delta = series.diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = (-delta).where(delta < 0, 0.0)
-        avg_gain = gain.rolling(window=period).mean()
-        avg_loss = loss.rolling(window=period).mean()
-        rs = avg_gain / avg_loss
-        return 100 - (100 / (1 + rs))
-
     def linear_regression(self, series, length):
         def linreg_single(x):
             if len(x) < length: return np.nan
@@ -117,8 +114,6 @@ class SqueezeMomentumIndicator:
         data['squeeze_on'] = squeeze_on
         data['momentum'] = momentum
         data['momentum_increasing'] = momentum > momentum.shift(1)
-        data['ema_200'] = data['close'].ewm(span=200, adjust=False).mean()
-        data['rsi'] = self.rsi(data['close'], 14)
         
         return data
 
@@ -131,26 +126,15 @@ class SqueezeMomentumIndicator:
         
         data['squeeze_release'] = (squeeze_on_safe.shift(1) == True) & (squeeze_on_safe == False)
         
-        ema_ok_buy = data['close'] > data['ema_200']
-        ema_ok_sell = data['close'] < data['ema_200']
-        rsi_safe = data['rsi'].fillna(50)
-        rsi_ok_buy = rsi_safe < 70
-        rsi_ok_sell = rsi_safe > 30
-
         buy_cond = (
             (data['squeeze_release'] == True) & 
             (data['momentum'] > 0) & 
-            (mom_inc_safe == True) &
-            (ema_ok_buy) &
-            (rsi_ok_buy)
+            (mom_inc_safe == True)
         )
         
         sell_cond = (
-            (data['squeeze_release'] == True) &
-            (data['momentum'] < 0) &
-            (~mom_inc_safe) &
-            (ema_ok_sell) &
-            (rsi_ok_sell)
+            ((data['momentum'] < 0) & (data['momentum'].shift(1).fillna(0) >= 0)) |
+            ((mom_inc_safe == False) & (mom_inc_safe.shift(1).fillna(True) == False) & (data['momentum'] > 0))
         )
         
         data.loc[buy_cond, 'signal'] = 1
@@ -174,7 +158,7 @@ def send_telegram_message(message):
     except Exception as e:
         print(f"Error sending Telegram message: {e}")
 
-def get_mexc_data(symbol, timeframe, limit=200):
+def get_mexc_data(symbol, timeframe, limit=100):
     exchange = ccxt.mexc({'enableRateLimit': True})
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -182,7 +166,7 @@ def get_mexc_data(symbol, timeframe, limit=200):
     df.set_index('timestamp', inplace=True)
     return df
 
-def get_top_mexc_coins(limit=50):
+def get_top_mexc_coins(limit=25):
     """Fetches top N coins sorted by 24h volume in USDT"""
     print(f"Fetching top {limit} coins by volume from MEXC...")
     exchange = ccxt.mexc({'enableRateLimit': True})
@@ -204,6 +188,33 @@ def get_top_mexc_coins(limit=50):
         print(f"Error fetching top coins list: {e}")
         return []
 
+# ================= Cooldown Functions =================
+def load_cooldown():
+    if COOLDOWN_FILE.exists():
+        try:
+            with open(COOLDOWN_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_cooldown(data):
+    try:
+        with open(COOLDOWN_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Could not save cooldown file: {e}")
+
+def is_on_cooldown(symbol, cooldown_data):
+    if symbol not in cooldown_data:
+        return False
+    try:
+        last_time = datetime.fromisoformat(cooldown_data[symbol])
+        elapsed_hours = (datetime.now() - last_time).total_seconds() / 3600
+        return elapsed_hours < COOLDOWN_HOURS
+    except Exception:
+        return False
+
 def main():
     print("=== Running Multi-Coin Scalping Bot ===")
     if not TELEGRAM_TOKEN or not CHANNEL_ID:
@@ -218,11 +229,17 @@ def main():
         print("Failed to get coin list. Aborting run.")
         return
 
+    cooldown_data = load_cooldown()
+    cooldown_skipped = 0
     indicator = SqueezeMomentumIndicator()
     signals_found = 0
 
     for symbol in top_coins:
         try:
+            if is_on_cooldown(symbol, cooldown_data):
+                cooldown_skipped += 1
+                continue
+
             time.sleep(0.5) 
             
             df = get_mexc_data(symbol, TIMEFRAME)
@@ -235,6 +252,7 @@ def main():
             
             if current_signal != 0:
                 signals_found += 1
+                cooldown_data[symbol] = datetime.now().isoformat()
                 targets_str = calculate_targets(current_price, current_signal)
                 
                 if current_signal == 1:
@@ -266,7 +284,8 @@ def main():
         except Exception as e:
             pass 
 
-    print(f"[{datetime.now()}] Scan finished. Total signals found: {signals_found}")
+    save_cooldown(cooldown_data)
+    print(f"[{datetime.now()}] Scan finished. Signals: {signals_found} | Cooldown skipped: {cooldown_skipped}")
 
 if __name__ == "__main__":
     main()
