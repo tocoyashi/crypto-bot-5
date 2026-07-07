@@ -15,6 +15,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
+      - name: Cache cooldown data
+        uses: actions/cache@v3
+        with:
+          path: cooldown.json
+          key: bot-cooldown
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
