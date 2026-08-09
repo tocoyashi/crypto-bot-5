@@ -17,7 +17,7 @@ CHANNEL_ID = os.environ.get('CHANNEL_ID')
 
 # ================= Trading Settings =================
 TIMEFRAME = '15m'
-TOP_N_COINS = 12
+TOP_N_COINS = 7
 STABLECOINS = ['USDC/USDT', 'TUSD/USDT', 'DAI/USDT', 'FDUSD/USDT', 'USDP/USDT', 'PYUSD/USDT']
 BLACKLIST = [
     'WXT/USDT', 'ANTFUN/USDT', 'UPC/USDT', 'RAIN/USDT', 'USD1/USDT', 'USDE/USDT',
