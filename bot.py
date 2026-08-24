@@ -16,8 +16,8 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHANNEL_ID = os.environ.get('CHANNEL_ID')
 
 # ================= Trading Settings =================
-TIMEFRAME = '15m'
-TOP_N_COINS = 7
+TIMEFRAME = '30m'
+TOP_N_COINS = 15
 STABLECOINS = ['USDC/USDT', 'TUSD/USDT', 'DAI/USDT', 'FDUSD/USDT', 'USDP/USDT', 'PYUSD/USDT']
 BLACKLIST = [
     'WXT/USDT', 'ANTFUN/USDT', 'UPC/USDT', 'RAIN/USDT', 'USD1/USDT', 'USDE/USDT',
@@ -27,10 +27,10 @@ BLACKLIST = [
 
 # ================= Risk Management Settings =================
 LEVERAGE = 10
-TP1_PERC = 0.6
-TP2_PERC = 1.5
-TP3_PERC = 2.4
-TP4_PERC = 5.0
+TP1_PERC = 0.7
+TP2_PERC = 1.8
+TP3_PERC = 2.8
+TP4_PERC = 4.0
 TP5_PERC = 7.0
 TP6_PERC = 9.0
 SL_PERC = 6.0
