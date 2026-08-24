@@ -26,7 +26,7 @@ BLACKLIST = [
 ]
 
 # ================= Risk Management Settings =================
-LEVERAGE = 10
+LEVERAGE = 12
 TP1_PERC = 0.7
 TP2_PERC = 1.8
 TP3_PERC = 2.8
